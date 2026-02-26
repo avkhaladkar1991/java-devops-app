@@ -6,77 +6,110 @@ pipeline {
   }
 
   environment {
-    IMAGE_NAME = "avkhaladkar1991/springboot-gitops-demo"
-    IMAGE_TAG  = "${BUILD_NUMBER}"
+    IMAGE_NAME   = "avkhaladkar1991/springboot-gitops-demo"
+    IMAGE_TAG    = "${BUILD_NUMBER}"
+    DOCKER_IMAGE = "${IMAGE_NAME}:${IMAGE_TAG}"
+
+    APP_REPO    = "https://github.com/avkhaladkar1991/java-devops-app.git"
+    GITOPS_REPO = "https://github.com/avkhaladkar1991/gitops-repo.git"
+  }
+
+  options {
+    timestamps()
   }
 
   stages {
 
-    stage('Checkout') {
+    stage('Checkout Application Code') {
       steps {
-        git credentialsId: 'github-creds',
-            url: 'https://github.com/avkhaladkar1991/java-devops-app.git',
-            branch: 'main'
+        git branch: 'main',
+            credentialsId: 'github-creds',
+            url: "${APP_REPO}"
       }
     }
 
-    stage('Build App') {
+    stage('Build Application') {
       steps {
-        dir('app') {
-          sh 'mvn clean package -DskipTests'
-        }
+        sh 'mvn clean package -DskipTests'
       }
     }
 
     stage('Docker Build') {
       steps {
-        dir('app') {
-          sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
-        }
+        sh "docker build -t ${DOCKER_IMAGE} ."
       }
     }
 
-    stage('Docker Push') {
+    stage('Docker Login & Push') {
       steps {
         withCredentials([usernamePassword(
           credentialsId: 'dockerhub-creds',
           usernameVariable: 'DOCKER_USER',
           passwordVariable: 'DOCKER_PASS'
         )]) {
-          sh '''
+          sh """
             echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-            docker push ${IMAGE_NAME}:${IMAGE_TAG}
-          '''
+            docker push ${DOCKER_IMAGE}
+          """
         }
       }
     }
 
-    stage('Update Helm values') {
-      steps {
-        sh '''
-          sed -i '' 's/tag:.*/tag: '"${IMAGE_TAG}"'/' helm/springboot-app/values.yaml
-        '''
-      }
-    }
-
-    stage('Commit & Push Helm Change') {
+    stage('Clone GitOps Repository') {
       steps {
         withCredentials([usernamePassword(
           credentialsId: 'github-creds',
           usernameVariable: 'GIT_USER',
           passwordVariable: 'GIT_TOKEN'
         )]) {
-          sh '''
-            git config user.email "jenkins@ci.com"
-            git config user.name "jenkins"
-            git commit -am "CI: update image tag ${IMAGE_TAG}" || true
-          '''
-          // 🔑 Jenkins Git plugin handles the push
-          git credentialsId: 'github-creds',
-              url: 'https://github.com/avkhaladkar1991/java-devops-app.git',
-              branch: 'main'
+          sh """
+            rm -rf gitops-repo
+            git clone https://${GIT_USER}:${GIT_TOKEN}@github.com/avkhaladkar1991/gitops-repo.git
+          """
         }
       }
+    }
+
+    stage('Update Helm Values (DEV)') {
+      steps {
+        sh """
+          sed -i '' 's/tag:.*/tag: "${IMAGE_TAG}"/' gitops-repo/dev/springboot-app/values.yaml
+        """
+      }
+    }
+
+    stage('Commit & Push GitOps Changes') {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: 'github-creds',
+          usernameVariable: 'GIT_USER',
+          passwordVariable: 'GIT_TOKEN'
+        )]) {
+          sh """
+            cd gitops-repo
+            git config user.email "jenkins@ci.com"
+            git config user.name "jenkins"
+            git add dev/springboot-app/values.yaml
+            git commit -m "CI: update image tag ${IMAGE_TAG}" || echo "No changes"
+            git push https://${GIT_USER}:${GIT_TOKEN}@github.com/avkhaladkar1991/gitops-repo.git main
+          """
+        }
+      }
+    }
+
+    stage('Cleanup Local Image') {
+      steps {
+        sh "docker rmi ${DOCKER_IMAGE} || true"
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "✅ CI Pipeline Completed Successfully"
+    }
+    failure {
+      echo "❌ CI Pipeline Failed"
     }
   }
 }
